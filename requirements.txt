@@ -1,0 +1,10 @@
+Flask
+Flask-CORS
+scikit-learn
+pandas
+numpy
+plotly
+streamlit
+requests
+threadpoolctl
+joblib
