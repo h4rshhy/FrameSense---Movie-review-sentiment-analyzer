@@ -8,3 +8,4 @@ streamlit
 requests
 threadpoolctl
 joblib
+transformers

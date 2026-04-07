@@ -6,14 +6,21 @@ from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics.pairwise import cosine_similarity
 import re
 import string
 import pickle
 import os
+import json
+import random
+from collections import defaultdict
 from transformers import pipeline
 
 app = Flask(__name__)
 CORS(app)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "sentiment_model.pkl")
 
 class MovieSentimentAnalyzer:
     def __init__(self):
@@ -128,7 +135,7 @@ class MovieSentimentAnalyzer:
             'individual_predictions': predictions
         }
 
-    def save_model(self, filename='sentiment_model.pkl'):
+    def save_model(self, filename=MODEL_PATH):
         """Save the trained model and vectorizer"""
         with open(filename, 'wb') as f:
             pickle.dump({
@@ -137,7 +144,7 @@ class MovieSentimentAnalyzer:
                 'is_trained': self.is_trained
             }, f)
 
-    def load_model(self, filename='sentiment_model.pkl'):
+    def load_model(self, filename=MODEL_PATH):
         """Load a trained model and vectorizer"""
         if os.path.exists(filename):
             with open(filename, 'rb') as f:
@@ -155,6 +162,18 @@ emotion_pipe = pipeline(
 )
 
 EMOTION_LABELS = ["joy", "sadness", "anger", "fear", "surprise", "disgust", "neutral"]
+MOVIE_PROFILE_PATH = os.path.join(BASE_DIR, "movie_emotion_profiles.json")
+
+PRESET_MOOD_VECTORS = {
+    "happy": {"joy": 0.72, "surprise": 0.12, "neutral": 0.10, "sadness": 0.02, "anger": 0.01, "fear": 0.01, "disgust": 0.02},
+    "sad": {"sadness": 0.68, "neutral": 0.12, "joy": 0.07, "fear": 0.07, "surprise": 0.03, "anger": 0.02, "disgust": 0.01},
+    "tense": {"fear": 0.48, "surprise": 0.18, "anger": 0.14, "neutral": 0.10, "sadness": 0.05, "disgust": 0.03, "joy": 0.02},
+    "angry": {"anger": 0.65, "disgust": 0.13, "fear": 0.07, "sadness": 0.06, "neutral": 0.05, "surprise": 0.03, "joy": 0.01},
+    "excited": {"joy": 0.50, "surprise": 0.28, "neutral": 0.10, "fear": 0.04, "sadness": 0.03, "anger": 0.03, "disgust": 0.02},
+    "nostalgic": {"sadness": 0.34, "joy": 0.30, "neutral": 0.18, "surprise": 0.08, "fear": 0.04, "anger": 0.03, "disgust": 0.03},
+    "adventurous": {"surprise": 0.34, "joy": 0.28, "fear": 0.14, "neutral": 0.12, "anger": 0.05, "sadness": 0.04, "disgust": 0.03},
+    "relaxed": {"neutral": 0.52, "joy": 0.24, "sadness": 0.08, "surprise": 0.06, "fear": 0.04, "anger": 0.03, "disgust": 0.03}
+}
 
 MOVIE_CATALOG = [
     {
@@ -216,6 +235,75 @@ MOVIE_CATALOG = [
 ]
 
 movie_fingerprint_cache = {}
+movie_profiles = []
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for", "from",
+    "had", "has", "have", "he", "her", "his", "i", "if", "in", "into", "is", "it",
+    "its", "me", "movie", "film", "my", "of", "on", "or", "our", "so", "that", "the",
+    "their", "them", "they", "this", "to", "too", "was", "were", "with", "you", "your"
+}
+
+ASPECT_KEYWORDS = {
+    "story": {"story", "plot", "narrative", "screenplay", "script", "ending", "twist", "writing"},
+    "characters": {"character", "characters", "arc", "relationship", "relationships", "chemistry"},
+    "acting": {"acting", "actor", "actors", "actress", "performances", "performance", "cast"},
+    "visuals": {"visual", "visuals", "cinematography", "shot", "shots", "animated", "animation", "spectacle"},
+    "pacing": {"pacing", "slow", "dragging", "dragged", "rushed", "tight", "boring"},
+    "emotion": {"emotional", "heart", "heartfelt", "moving", "sad", "joyful", "hopeful", "touching"},
+    "humor": {"funny", "humor", "humorous", "hilarious", "comedy", "jokes", "witty"},
+    "tension": {"tense", "tension", "thrilling", "thriller", "suspense", "suspenseful", "mystery"},
+    "action": {"action", "exciting", "battle", "fight", "adventure", "adrenaline"},
+    "music": {"music", "score", "soundtrack", "songs", "musical"},
+    "originality": {"original", "unique", "fresh", "inventive", "creative", "different"}
+}
+
+POSITIVE_HINTS = {
+    "love", "loved", "like", "liked", "great", "amazing", "excellent", "fantastic", "strong",
+    "beautiful", "brilliant", "smart", "sharp", "fun", "funny", "moving", "emotional",
+    "tense", "thrilling", "engaging", "gripping", "powerful", "touching", "hopeful"
+}
+
+NEGATIVE_HINTS = {
+    "hate", "hated", "dislike", "disliked", "bad", "weak", "boring", "slow", "messy",
+    "flat", "predictable", "confusing", "dull", "annoying", "rushed", "dragging",
+    "dragged", "underwhelming", "generic", "bland"
+}
+
+def normalize_emotion_scores(emotions):
+    normalized = {label: float(emotions.get(label, 0.0)) for label in EMOTION_LABELS}
+    total = sum(normalized.values())
+    if total > 0:
+        normalized = {label: value / total for label, value in normalized.items()}
+    return normalized
+
+def load_movie_profiles():
+    if not os.path.exists(MOVIE_PROFILE_PATH):
+        return []
+
+    try:
+        with open(MOVIE_PROFILE_PATH, 'r', encoding='utf-8') as f:
+            loaded_profiles = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠️ Could not load movie profiles: {exc}")
+        return []
+
+    prepared_profiles = []
+    for profile in loaded_profiles:
+        emotions = normalize_emotion_scores(profile.get("emotion_profile", {}))
+        prepared_profile = {
+            "title": profile.get("title"),
+            "poster_url": profile.get("poster_url"),
+            "rating": float(profile.get("rating") or 0.0),
+            "vote_count": int(profile.get("vote_count") or 0),
+            "overview": profile.get("overview") or "Overview unavailable.",
+            "release_year": profile.get("release_year"),
+            "dominant_emotion": profile.get("dominant_emotion") or max(emotions, key=emotions.get),
+            "emotion_profile": emotions
+        }
+        prepared_profiles.append(prepared_profile)
+
+    return prepared_profiles
 
 def get_emotions(text):
     results = emotion_pipe(text[:512], top_k=None, truncation=True)
@@ -330,40 +418,209 @@ def get_movie_fingerprint(movie):
 def build_emotion_vector(emotions):
     return np.array([emotions.get(label, 0) for label in EMOTION_LABELS], dtype=float)
 
+
+def cosine_similarity_score(vector_a, vector_b):
+    norm_a = np.linalg.norm(vector_a)
+    norm_b = np.linalg.norm(vector_b)
+    if not norm_a or not norm_b:
+        return 0.0
+    return float(np.dot(vector_a, vector_b) / (norm_a * norm_b))
+
+
+def tokenize_text(text):
+    return [
+        token for token in re.findall(r"\b[a-zA-Z']+\b", (text or "").lower())
+        if token not in STOPWORDS and len(token) > 2
+    ]
+
+
+def extract_review_preferences(review):
+    lower_review = (review or "").lower()
+    tokens = tokenize_text(lower_review)
+    token_counts = defaultdict(int)
+    for token in tokens:
+        token_counts[token] += 1
+
+    positive_aspects = set()
+    negative_aspects = set()
+
+    for aspect, keywords in ASPECT_KEYWORDS.items():
+        keyword_hits = keywords.intersection(token_counts.keys())
+        if not keyword_hits:
+            continue
+
+        positive_signal = any(word in lower_review for word in POSITIVE_HINTS)
+        negative_signal = any(word in lower_review for word in NEGATIVE_HINTS)
+
+        if positive_signal and not negative_signal:
+            positive_aspects.add(aspect)
+        elif negative_signal and not positive_signal:
+            negative_aspects.add(aspect)
+        else:
+            nearest_positive = 0
+            nearest_negative = 0
+            for sentence in re.split(r"[.!?]+", lower_review):
+                if not sentence.strip():
+                    continue
+                has_aspect = any(keyword in sentence for keyword in keywords)
+                if not has_aspect:
+                    continue
+                if any(word in sentence for word in POSITIVE_HINTS):
+                    nearest_positive += 1
+                if any(word in sentence for word in NEGATIVE_HINTS):
+                    nearest_negative += 1
+            if nearest_positive > nearest_negative:
+                positive_aspects.add(aspect)
+            elif nearest_negative > nearest_positive:
+                negative_aspects.add(aspect)
+
+    return {
+        "positive_aspects": sorted(positive_aspects),
+        "negative_aspects": sorted(negative_aspects),
+        "keywords": list(dict.fromkeys(tokens))[:12]
+    }
+
+
+def score_movie_aspects(movie):
+    text = " ".join([
+        movie.get("title", ""),
+        movie.get("overview", ""),
+        movie.get("dominant_emotion", "")
+    ]).lower()
+
+    aspect_scores = {}
+    for aspect, keywords in ASPECT_KEYWORDS.items():
+        matches = sum(1 for keyword in keywords if keyword in text)
+        aspect_scores[aspect] = min(1.0, matches / 2) if matches else 0.0
+
+    dominant_emotion = movie.get("dominant_emotion")
+    if dominant_emotion == "joy":
+        aspect_scores["humor"] = max(aspect_scores.get("humor", 0.0), 0.45)
+        aspect_scores["emotion"] = max(aspect_scores.get("emotion", 0.0), 0.35)
+    if dominant_emotion == "fear":
+        aspect_scores["tension"] = max(aspect_scores.get("tension", 0.0), 0.55)
+    if dominant_emotion == "surprise":
+        aspect_scores["story"] = max(aspect_scores.get("story", 0.0), 0.45)
+        aspect_scores["originality"] = max(aspect_scores.get("originality", 0.0), 0.4)
+
+    return aspect_scores
+
+
+def overlap_score(review_keywords, movie):
+    if not review_keywords:
+        return 0.0
+    movie_tokens = set(tokenize_text(f"{movie.get('title', '')} {movie.get('overview', '')}"))
+    if not movie_tokens:
+        return 0.0
+    overlap = len(set(review_keywords).intersection(movie_tokens))
+    return overlap / max(1, min(8, len(set(review_keywords))))
+
+
+def build_recommendation_reason(movie, shared_emotions, positive_aspects, improved_aspects):
+    parts = []
+    if shared_emotions:
+        parts.append(f"keeps the same {', '.join(shared_emotions)} energy")
+    if positive_aspects:
+        parts.append(f"leans into what you liked about the {', '.join(positive_aspects[:2])}")
+    if improved_aspects:
+        parts.append(f"should land better on {', '.join(improved_aspects[:2])}")
+    if not parts:
+        parts.append("is emotionally close to the tone of your review")
+
+    return f"This pick {' and '.join(parts)}."
+
+def build_mood_vector(preset_mood=None, free_text=None):
+    vectors = []
+
+    if preset_mood:
+        preset_scores = PRESET_MOOD_VECTORS.get(preset_mood)
+        if not preset_scores:
+            raise ValueError("Invalid preset mood.")
+        vectors.append(build_emotion_vector(normalize_emotion_scores(preset_scores)))
+
+    if free_text:
+        free_text_scores = normalize_emotion_scores(get_emotions(free_text))
+        vectors.append(build_emotion_vector(free_text_scores))
+
+    if not vectors:
+        raise ValueError("At least one mood input is required.")
+
+    return np.mean(vectors, axis=0)
+
 def recommend_movies(review, emotions, sentiment_result, top_n=3):
+    candidate_movies = movie_profiles if movie_profiles else MOVIE_CATALOG
     review_vector = build_emotion_vector(emotions)
-    review_norm = np.linalg.norm(review_vector)
     recommendations = []
     top_review_emotions = [label for label, _ in get_top_emotions(emotions, 2)]
+    review_preferences = extract_review_preferences(review)
+    positive_aspects = review_preferences["positive_aspects"]
+    negative_aspects = review_preferences["negative_aspects"]
+    review_keywords = review_preferences["keywords"]
 
-    for movie in MOVIE_CATALOG:
-        movie_emotions = get_movie_fingerprint(movie)
+    for movie in candidate_movies:
+        movie_emotions = movie.get("emotion_profile") or get_movie_fingerprint(movie)
         movie_vector = build_emotion_vector(movie_emotions)
-        movie_norm = np.linalg.norm(movie_vector)
-        similarity = 0.0
-        if review_norm and movie_norm:
-            similarity = float(np.dot(review_vector, movie_vector) / (review_norm * movie_norm))
+        similarity = cosine_similarity_score(review_vector, movie_vector)
+        aspect_scores = score_movie_aspects(movie)
+        liked_alignment = (
+            sum(aspect_scores.get(aspect, 0.0) for aspect in positive_aspects) / len(positive_aspects)
+            if positive_aspects else 0.0
+        )
+        improvement_alignment = (
+            sum((1 - aspect_scores.get(aspect, 0.0)) for aspect in negative_aspects) / len(negative_aspects)
+            if negative_aspects else 0.0
+        )
+        keyword_overlap = overlap_score(review_keywords, movie)
+        rating_quality = max(0.0, min(1.0, float(movie.get("rating", 0.0)) / 10))
+
+        final_score = (
+            0.45 * similarity
+            + 0.20 * liked_alignment
+            + 0.15 * improvement_alignment
+            + 0.10 * keyword_overlap
+            + 0.10 * rating_quality
+        )
 
         shared_emotions = [
             label for label, _ in get_top_emotions(movie_emotions, 3)
             if label in top_review_emotions
         ]
-        reason = f"Matches the review's {', '.join(top_review_emotions)} profile and feels {movie['why_it_hits']}."
-        if shared_emotions:
-            reason = f"Shared emotional signals in {', '.join(shared_emotions)} make this a strong match; it also feels {movie['why_it_hits']}."
+        improved_aspects = [
+            aspect for aspect in negative_aspects
+            if aspect_scores.get(aspect, 0.0) < 0.35
+        ]
+        reason = build_recommendation_reason(movie, shared_emotions, positive_aspects, improved_aspects)
 
         recommendations.append({
             "title": movie["title"],
-            "year": movie["year"],
+            "year": movie.get("year") or movie.get("release_year"),
             "poster_url": movie.get("poster_url"),
             "overview": movie["overview"],
-            "match_score": round(similarity, 3),
+            "match_score": round(final_score, 3),
             "reason": reason,
-            "sentiment_fit": sentiment_result["sentiment"]
+            "sentiment_fit": sentiment_result["sentiment"],
+            "rating": round(float(movie.get("rating", 0.0)), 1)
         })
 
-    recommendations = sorted(recommendations, key=lambda item: item["match_score"], reverse=True)
-    return recommendations[:top_n]
+    recommendations = sorted(
+        recommendations,
+        key=lambda item: (item["match_score"], item.get("rating", 0.0)),
+        reverse=True
+    )
+
+    candidate_pool = recommendations[:min(18, len(recommendations))]
+    if len(candidate_pool) <= top_n:
+        return candidate_pool[:top_n]
+
+    random.shuffle(candidate_pool)
+    selected = sorted(
+        candidate_pool[:top_n],
+        key=lambda item: (item["match_score"], item.get("rating", 0.0)),
+        reverse=True
+    )
+    return selected
+
+movie_profiles = load_movie_profiles()
 
 # Try to load existing model
 try:
@@ -462,8 +719,66 @@ def analyze_movie():
 def get_status():
     return jsonify({
         'is_trained': analyzer.is_trained,
-        'model_ready': analyzer.is_trained
+        'model_ready': analyzer.is_trained,
+        'movie_profiles_loaded': len(movie_profiles)
     })
+
+@app.route('/api/suggest', methods=['POST'])
+def suggest_movies():
+    try:
+        data = request.get_json() or {}
+        preset_mood = (data.get('preset_mood') or '').strip().lower()
+        free_text = (data.get('free_text') or '').strip()
+
+        if not preset_mood and not free_text:
+            return jsonify({'error': 'Provide preset_mood, free_text, or both.'}), 400
+
+        if not movie_profiles:
+            return jsonify({'error': 'Movie profiles are unavailable. Generate movie_emotion_profiles.json first.'}), 503
+
+        mood_vector = build_mood_vector(preset_mood=preset_mood or None, free_text=free_text or None).reshape(1, -1)
+        results = []
+
+        for movie in movie_profiles:
+            if movie['vote_count'] < 50:
+                continue
+
+            movie_vector = build_emotion_vector(movie['emotion_profile']).reshape(1, -1)
+            similarity = float(cosine_similarity(mood_vector, movie_vector)[0][0])
+            normalized_similarity = max(0.0, min(1.0, (similarity + 1) / 2))
+            normalized_rating = max(0.0, min(1.0, movie['rating'] / 10))
+            final_score = (0.7 * normalized_similarity) + (0.3 * normalized_rating)
+
+            results.append({
+                'title': movie['title'],
+                'poster': movie['poster_url'],
+                'rating': round(movie['rating'], 1),
+                'dominant_emotion': movie['dominant_emotion'],
+                'release_year': movie['release_year'],
+                'overview': movie['overview'],
+                'emotional_match': round(final_score * 100, 1)
+            })
+
+        results = sorted(results, key=lambda item: item['emotional_match'], reverse=True)
+        if not results:
+            return jsonify({'results': [], 'total_candidates': 0})
+
+        candidate_pool = sorted(results, key=lambda item: item['emotional_match'], reverse=True)
+        pool_size = min(len(candidate_pool), max(10, min(30, len(candidate_pool))))
+        candidate_pool = candidate_pool[:pool_size]
+        selection_size = min(10, len(candidate_pool))
+        selection = random.sample(candidate_pool, selection_size)
+        selection = sorted(selection, key=lambda item: item['emotional_match'], reverse=True)
+
+        return jsonify({
+            'results': selection,
+            'total_candidates': len(candidate_pool)
+        })
+
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5001)
